@@ -64,9 +64,7 @@ jobs:
           name: python-app
 
       - name: Unzip artifact for deployment
-        run: |
-          unzip release.zip
-          rm release.zip
+        run: unzip release.zip
         
       - name: Login to Azure
         uses: azure/login@v2
@@ -75,13 +73,21 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_74B568153008444C8A751ADBFC3AADC8 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1D53E243B6E84AD1BF15323CCDCE549C }}
 
+      - name: Set Function App Configuration
+        run: |
+          az functionapp config appsettings set \
+            --name 'bmodeler-teams-streaming' \
+            --resource-group 'bmodelr-dev-rg' \
+            --settings \
+              "FUNCTIONS_WORKER_RUNTIME=python" \
+              "FUNCTIONS_EXTENSION_VERSION=~4" \
+              "AzureWebJobsStorage__accountName=bmodelrblob" \
+              "PYTHON_ISOLATE_WORKER_DEPENDENCIES=1"
+
       - name: 'Deploy to Azure Functions'
-        uses: Azure/functions-action@v1
-        id: deploy-to-function
-        with:
-          app-name: 'bmodeler-teams-streaming'
-          slot-name: 'Production'
-          package: '.'
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+        run: |
+          az functionapp deployment source config-zip \
+            --name 'bmodeler-teams-streaming' \
+            --resource-group 'bmodelr-dev-rg' \
+            --src release.zip
           
