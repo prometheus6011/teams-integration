@@ -132,4 +132,4 @@ jobs:
             --resource-group "${{ env.FUNCTIONAPP_RG }}" >/dev/null
 
       - name: Echo package URL
-        run: echo "App now runs from: ${{ steps.sas.outputs.pkg }} (expires ${{ steps.sas.outputs.expiry }})"
+        run: echo "App now runs from ${{ steps.sas.outputs.pkg }} expires ${{ steps.sas.outputs.expiry }}"
