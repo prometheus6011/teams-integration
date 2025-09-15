@@ -75,11 +75,18 @@ jobs:
 
       - name: Set Function App Configuration
         run: |
+          # Get storage account key
+          STORAGE_KEY=$(az storage account keys list \
+            --account-name "bmodelrblob" \
+            --resource-group "bmodelr-dev-rg" \
+            --query "[0].value" -o tsv)
+
+          # Set app settings with storage connection string
           az functionapp config appsettings set \
             --name 'bmodeler-teams-streaming' \
             --resource-group 'bmodelr-dev-rg' \
             --settings \
-              "AzureWebJobsStorage__accountName=bmodelrblob" \
+              "AzureWebJobsStorage=DefaultEndpointsProtocol=https;AccountName=bmodelrblob;AccountKey=${STORAGE_KEY};EndpointSuffix=core.windows.net" \
               "PYTHON_ISOLATE_WORKER_DEPENDENCIES=1"
 
       - name: 'Deploy to Azure Functions'
