@@ -1,85 +1,135 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
-
 name: Build and deploy Python project to Azure Function App - bmodeler-teams-streaming
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.' # set this to the path to your web app project, defaults to the repository root
-  PYTHON_VERSION: '3.11' # set this to the python version to use (supports 3.6, 3.7, 3.8)
+  PYTHON_VERSION: "3.11"
+  # === Fill these if they differ ===
+  FUNCTIONAPP_NAME: "bmodeler-teams-streaming"
+  FUNCTIONAPP_RG:   "bmodelr-dev-rg"
+  STORAGE_ACCOUNT:  "bmodelrblob"
+  CONTAINER:        "deploy"
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python version
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Create and start virtual environment
+      - name: (Optional) Install deps for validation
         run: |
           python -m venv venv
           source venv/bin/activate
+          pip install -r requirements.txt
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Optional: Add step to run tests here
-
-      - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
-
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-app
-          path: |
-            release.zip
-            !venv/
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-
-      - name: Unzip artifact for deployment
+      - name: Create clean deployment zip
         run: |
-          unzip release.zip
-          rm release.zip
-        
-      - name: Login to Azure
+          zip -r func.zip . \
+            -x ".git/*" ".vscode/*" "*.venv/*" "*__pycache__/*" "*.DS_Store" \
+               "*.PublishSettings" "deploy*.sh"
+
+      # ---- Azure login (Federated credentials / OIDC) ----
+      - name: Azure Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_83BCB97D880F454F890E78387215F508 }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_74B568153008444C8A751ADBFC3AADC8 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1D53E243B6E84AD1BF15323CCDCE549C }}
 
-      - name: 'Deploy to Azure Functions'
-        uses: Azure/functions-action@v1
-        id: deploy-to-function
-        with:
-          app-name: 'bmodeler-teams-streaming'
-          slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          
+      # ---- Upload zip to Blob ----
+      # If you already store the storage key in GitHub secrets, set STORAGE_KEY and this step
+      # will use it; otherwise it will try to fetch a key via 'az' (requires RBAC perms).
+      - name: Resolve Storage Account Key
+        id: stkey
+        shell: bash
+        run: |
+          if [[ -n "${{ secrets.STORAGE_KEY }}" ]]; then
+            echo "key=${{ secrets.STORAGE_KEY }}" >> $GITHUB_OUTPUT
+          else
+            KEY=$(az storage account keys list \
+              --account-name "${{ env.STORAGE_ACCOUNT }}" \
+              --resource-group "${{ env.FUNCTIONAPP_RG }}" \
+              --query "[0].value" -o tsv)
+            if [[ -z "$KEY" ]]; then
+              echo "Storage key not found; set secrets.STORAGE_KEY or grant key-list permission." >&2
+              exit 1
+            fi
+            echo "key=$KEY" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Ensure container exists
+        run: |
+          az storage container create \
+            --name "${{ env.CONTAINER }}" \
+            --account-name "${{ env.STORAGE_ACCOUNT }}" \
+            --account-key "${{ steps.stkey.outputs.key }}" \
+            >/dev/null
+
+      - name: Upload func.zip to Blob
+        id: upload
+        run: |
+          BLOB="func-${GITHUB_SHA}.zip"
+          az storage blob upload \
+            --account-name "${{ env.STORAGE_ACCOUNT }}" \
+            --account-key "${{ steps.stkey.outputs.key }}" \
+            --container-name "${{ env.CONTAINER }}" \
+            --name "$BLOB" \
+            --file func.zip \
+            --overwrite true >/dev/null
+          echo "blob=$BLOB" >> $GITHUB_OUTPUT
+
+      - name: Generate read-only SAS for the blob (24h)
+        id: sas
+        run: |
+          EXP=$(date -u -d '+1 day' '+%Y-%m-%dT%H:%MZ')
+          SAS=$(az storage blob generate-sas \
+            --account-name "${{ env.STORAGE_ACCOUNT }}" \
+            --account-key "${{ steps.stkey.outputs.key }}" \
+            --container-name "${{ env.CONTAINER }}" \
+            --name "${{ steps.upload.outputs.blob }}" \
+            --permissions r \
+            --expiry "$EXP" \
+            --https-only -o tsv)
+          PKG="https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net/${{ env.CONTAINER }}/${{ steps.upload.outputs.blob }}?${SAS}"
+          echo "pkg=$PKG" >> $GITHUB_OUTPUT
+          echo "expiry=$EXP" >> $GITHUB_OUTPUT
+
+      # ---- Point the Function App at the package ----
+      - name: Set WEBSITE_RUN_FROM_PACKAGE
+        run: |
+          az functionapp config appsettings set \
+            --name "${{ env.FUNCTIONAPP_NAME }}" \
+            --resource-group "${{ env.FUNCTIONAPP_RG }}" \
+            --settings "WEBSITE_RUN_FROM_PACKAGE=${{ steps.sas.outputs.pkg }}" \
+            >/dev/null
+
+      # (Optional but helpful) Ensure core settings exist
+      - name: Ensure core app settings
+        run: |
+          az functionapp config appsettings set \
+            --name "${{ env.FUNCTIONAPP_NAME }}" \
+            --resource-group "${{ env.FUNCTIONAPP_RG }}" \
+            --settings "FUNCTIONS_WORKER_RUNTIME=python" "FUNCTIONS_EXTENSION_VERSION=~4" \
+            >/dev/null
+
+      - name: Restart Function App
+        run: |
+          az functionapp restart \
+            --name "${{ env.FUNCTIONAPP_NAME }}" \
+            --resource-group "${{ env.FUNCTIONAPP_RG }}" >/dev/null
+
+      - name: Echo package URL
+        run: echo "App now runs from: ${{ steps.sas.outputs.pkg }} (expires ${{ steps.sas.outputs.expiry }})"
