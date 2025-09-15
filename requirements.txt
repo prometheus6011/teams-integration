@@ -1,0 +1,8 @@
+azure-functions
+azure-identity
+azure-storage-blob
+msal
+requests
+pyjwt
+cryptography
+typing-extensions
